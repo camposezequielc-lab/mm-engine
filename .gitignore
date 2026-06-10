@@ -1,0 +1,19 @@
+# build trees
+build/
+out/
+.vs/
+CMakeUserPresets.json
+
+# engine runtime output
+log/
+store/
+data/
+logs/
+*.csv
+
+# secrets — keep credentials out of the repo
+config/credentials.txt
+
+# OS noise
+Thumbs.db
+.DS_Store

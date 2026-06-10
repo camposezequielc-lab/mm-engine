@@ -1,0 +1,7 @@
+global:
+  scrape_interval: 1s        # the engine publishes at 1 Hz
+
+scrape_configs:
+  - job_name: mm_engine
+    static_configs:
+      - targets: ["host.docker.internal:9091"]

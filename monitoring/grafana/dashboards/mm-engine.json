@@ -1,0 +1,79 @@
+{
+  "title": "MM Engine — Latency / Throughput / Backlog",
+  "uid": "mm-engine",
+  "timezone": "browser",
+  "refresh": "1s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "F1: MD processing latency (ns)",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ns" }, "overrides": [] },
+      "targets": [
+        { "expr": "mm_latency_ns{flow=\"md_processing\",q=\"p50\"}", "legendFormat": "p50" },
+        { "expr": "mm_latency_ns{flow=\"md_processing\",q=\"p90\"}", "legendFormat": "p90" },
+        { "expr": "mm_latency_ns{flow=\"md_processing\",q=\"p99\"}", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "F2: Tick-to-trade latency (ns)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ns" }, "overrides": [] },
+      "targets": [
+        { "expr": "mm_latency_ns{flow=\"tick_to_trade\",q=\"p50\"}", "legendFormat": "p50" },
+        { "expr": "mm_latency_ns{flow=\"tick_to_trade\",q=\"p90\"}", "legendFormat": "p90" },
+        { "expr": "mm_latency_ns{flow=\"tick_to_trade\",q=\"p99\"}", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Throughput (MD msgs/s)",
+      "gridPos": { "x": 0, "y": 8, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "mm_throughput_msgs_per_s", "legendFormat": "TPS" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue backlog high-water marks",
+      "gridPos": { "x": 8, "y": 8, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "mm_queue_backlog_max{queue=\"md_in\"}", "legendFormat": "md_in" },
+        { "expr": "mm_queue_backlog_max{queue=\"order_out\"}", "legendFormat": "order_out" },
+        { "expr": "mm_queue_backlog_max{queue=\"log\"}", "legendFormat": "log" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Orders / Cancels / Execs (rate)",
+      "gridPos": { "x": 16, "y": 8, "w": 8, "h": 8 },
+      "targets": [
+        { "expr": "rate(mm_events_total{type=\"orders\"}[30s])", "legendFormat": "orders/s" },
+        { "expr": "rate(mm_events_total{type=\"cancels\"}[30s])", "legendFormat": "cancels/s" },
+        { "expr": "rate(mm_events_total{type=\"execs\"}[30s])", "legendFormat": "execs/s" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue wait (ring residency, ns)",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ns" }, "overrides": [] },
+      "targets": [
+        { "expr": "mm_latency_ns{flow=\"queue_wait\",q=\"p50\"}", "legendFormat": "p50" },
+        { "expr": "mm_latency_ns{flow=\"queue_wait\",q=\"p99\"}", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "MD dropped (total)",
+      "gridPos": { "x": 12, "y": 16, "w": 6, "h": 8 },
+      "targets": [
+        { "expr": "mm_events_total{type=\"md_dropped\"}", "legendFormat": "dropped" }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

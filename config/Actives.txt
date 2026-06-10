@@ -1,0 +1,7 @@
+# Lista de instrumentos a suscribir
+DLR/JUN26
+DLR/JUN26M
+DLR/JUL26
+DLR/JUL26M
+DLR/AGO26
+DLR/AGO26M
