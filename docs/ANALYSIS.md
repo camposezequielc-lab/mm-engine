@@ -191,20 +191,6 @@ Event coalescing in the strategy: the venue only sends full refreshes
 snapshot per symbol and skip the stale ones. Cheap to add, bounds worst-case
 work in a storm.
 
-### The GPU question
-
-The exercise suggests considering GPU acceleration, so, explicitly: I looked
-at it and rejected it for the trading path. A PCIe round trip is 5-20us and
-the whole CPU hot path here is ~0.1us; offloading the decision would make it
-50-200x slower. Kernel launch overhead alone (~5us even with CUDA Graphs)
-dwarfs the work, which is a few comparisons and two FMAs over a 5-level book
-for six symbols - tiny, branchy, latency-critical, basically the worst shape
-of work you can hand a GPU. The data parallelism that does exist at this scale
-is served on-core: the book's VWAP uses AVX2 FMA, costs a few nanoseconds, and
-the data never leaves L1. A GPU would earn its keep offline - replaying the
-LMDB history to backtest thousands of parameter variants in parallel - but
-that's research tooling, not the hot path.
-
 ## 6. reMarkets connectivity
 
 For completeness, since the live venue didn't cooperate. The TLS/TCP leg to

@@ -1,8 +1,9 @@
-# mm-engine — Low-Latency Market Making Engine (ROFEX / reMarkets)
+# mm-engine
 
-A C++17 market-making engine for 6 DLR futures on Primary's reMarkets simulator,
-connected over FIX 5.0 SP2 (QuickFIX), with lock-free internals, LMDB persistence,
-and a Prometheus + Grafana observability stack.
+A low-latency market-making engine for six DLR futures on Primary's reMarkets
+simulator (ROFEX). C++17, QuickFIX over FIX 5.0 SP2, lock-free internals, LMDB
+persistence, Prometheus + Grafana for metrics. Built and tested on Windows 11
+with Visual Studio 2022; builds on Linux too.
 
 ```
                 ┌─────────────────────────  HOT PATH  ─────────────────────────┐
@@ -15,131 +16,99 @@ and a Prometheus + Grafana observability stack.
                                         └──────────────────────── Sender thread ──► FIX D/F out
  COLD PATH:
    Strategy ──[SnapRing/TradeRing]──► LMDB thread (batched txns)
-   Strategy ──[LogRing]────────────► Async CSV logger (ops_live.csv)
+   Strategy ──[LogRing]────────────► async CSV logger (ops_live.csv)
    Metrics thread (1 Hz) ──────────► Prometheus :9091 ──► Grafana :3000
 ```
 
-## Design summary
+## Design notes
 
-**Threading.** One pipeline stage per thread, communicating exclusively through
-single-producer/single-consumer lock-free ring buffers (`src/common/spsc_ring.hpp`).
-There are no mutexes anywhere on the hot path; the only shared writes are ring
-publishes (release stores) and relaxed atomic metric counters. The strategy thread
-and the order sender are pinned to dedicated cores (`STRATEGY_CORE`, `FIX_CORE` in
-`config/strategy.cfg`) and busy-spin with `_mm_pause`, which removes scheduler
-wake-up latency (typically 5–50 µs per wake) from the tick-to-trade path.
+Threading: one pipeline stage per thread, connected only by single-producer/
+single-consumer lock-free rings (`src/common/spsc_ring.hpp`). No mutexes on the
+hot path; the only shared writes are ring publishes and relaxed atomic
+counters. The strategy thread and the sender are pinned to dedicated cores
+(`STRATEGY_CORE` / `FIX_CORE` in `config/strategy.cfg`) and busy-spin with
+`_mm_pause`, since a scheduler wake-up alone costs more than the whole
+decision.
 
-**Memory.** Every event crossing a thread boundary is a fixed-size trivially-copyable
-POD (`src/common/events.hpp`); rings are preallocated arrays, so the steady-state hot
-path performs zero heap allocations. Head/tail indices live on separate cache lines
-with locally cached copies of the opposite index, so the common push/pop touches only
-one line and avoids cross-core coherence traffic. An `ObjectPool` is provided for
-stages that need transient objects.
+Memory: everything that crosses a thread boundary is a fixed-size POD
+(`src/common/events.hpp`) and the rings are preallocated, so steady state does
+zero heap allocations. Ring head/tail indices sit on separate cache lines with
+cached copies of the opposite index, so a push or pop normally touches one
+line and causes no coherence traffic. The C4324 padding warnings MSVC prints
+during the build are this alignment doing its job.
 
-**Order book.** Market data from ROFEX arrives as Snapshot/Full Refresh (the engine
-requests `MDUpdateType=0`), and the spec caps depth at 5. The optimal structure is
-therefore two flat arrays per side inside a cache-line-aligned struct: applying a
-snapshot is a straight copy, and best bid/ask is element zero — no trees, no hashing,
-no pointer chasing. Depth is configurable 1–5 (`BOOK_DEPTH`). The theoretical price
-uses the mid by default; a depth-weighted VWAP is implemented with AVX2 FMA intrinsics
-(`src/book/order_book.hpp`) with a scalar fallback.
+Order book: ROFEX sends full snapshots only (`MDUpdateType=0`) with depth
+capped at 5, so the book is just two flat arrays per side in a cache-aligned
+struct. Applying a snapshot is a memcpy; best bid/ask is element zero. The
+theoretical price uses the mid by default, with a depth-weighted VWAP
+implemented in AVX2 FMA (`src/book/order_book.hpp`, scalar fallback included).
 
-**Strategy (per the assignment).** On every snapshot the engine computes the market
-spread. If `spread >= MINIMUM_SPREAD` it quotes a buy at `BestBid + 1 tick` and a sell
-at `BestAsk - 1 tick`, aiming to become the new BBA and capture the spread; quotes are
-moved by cancel-then-requote when the market moves more than a tick. If
-`spread < MINIMUM_SPREAD` the market is considered tight and all working orders are
-cancelled. One working quote per symbol/side is tracked by a fixed-array order-state
-machine (`src/oms/order_manager.hpp`).
+Strategy, as specified by the assignment: on each snapshot, if the market
+spread is at least `MINIMUM_SPREAD` the engine quotes a buy at BestBid + 1 tick
+and a sell at BestAsk - 1 tick; if the spread is tighter than that it cancels
+everything. Quotes follow the market by cancel-then-requote. One working quote
+per symbol and side is tracked by a small state machine
+(`src/oms/order_manager.hpp`) so the engine never double-quotes an
+unacknowledged order.
 
-**Persistence.** The strategy pushes periodic `BookSnapshot` PODs and every fill into
-SPSC rings; a dedicated thread drains them into LMDB using one write transaction per
-batch (`src/persist/lmdb_persister.hpp`). The PODs are the serialized form, so the hot
-path pays a ~200-byte memcpy into a ring and nothing else — the mmap write and commit
-fsync are entirely on the cold thread.
+Persistence: the strategy pushes periodic book snapshots and every fill into
+rings; a dedicated thread drains them into LMDB with one write transaction per
+batch (`src/storage/lmdb_persister.hpp`). The hot path pays a ~200-byte copy
+into a ring; the mmap writes and the commit happen on the cold thread.
 
-**Metrics.** A lock-free log2-bucketed histogram (HdrHistogram-style, ~5 ns per
-record, ~3% relative error) captures the two required critical flows: F1
-`md_processing` (FIX callback entry → order book updated) and F2 `tick_to_trade`
-(FIX callback entry → NewOrderSingle handed to the socket), plus `queue_wait` (ring
-residency, which isolates backlog-induced delay). Throughput (TPS) and the high-water
-mark of every internal queue are published at 1 Hz to Prometheus and to stdout.
+Metrics: a lock-free log2-bucketed histogram (~5 ns per record) captures the
+two flows the assignment asks for -- F1 `md_processing` (FIX callback entry to
+book updated) and F2 `tick_to_trade` (same entry to NewOrderSingle on the
+socket) -- plus `queue_wait`, which isolates ring residency from compute.
+Throughput and per-queue high-water marks are published at 1 Hz to Prometheus
+and echoed to stdout. Orders, cancels and executions are also logged through a
+ring to an async CSV writer, so the hot path never formats a string.
 
-**Operations log.** Every order, cancel and execution is logged as a POD into a ring
-drained by an async CSV writer — the hot path never formats strings or touches the
-filesystem. Output `ops_live.csv` is directly loadable in pandas for post-trade
-strategy analysis.
 
-## A note on GPU usage (asked during design)
-
-We deliberately do **not** use the GPU on the trading path. A GPU kernel launch plus
-PCIe round trip costs 5–20 µs in the best case — two orders of magnitude more than
-this engine's entire hot path (~70–110 ns per event measured, see
-`docs/ANALYSIS.md`). GPUs win on throughput for large batched workloads (pricing
-thousands of options, training models, end-of-day risk), not on the latency of
-deciding on a single 200-byte book update. Where data-parallelism genuinely helps at
-this scale, SIMD on the CPU is the right tool, and that is what the AVX2 VWAP and the
-flat-array book layout exploit. This is the answer an interviewer expects: knowing
-*where not* to use the GPU is part of low-latency design.
-
----
-
-## Setup on Windows + Visual Studio 2022
+## Setup (Windows + Visual Studio 2022)
 
 ### 1. Prerequisites
 
-Install, in this order:
-
-1. **Visual Studio 2022** (17.8+) with the workload **"Desktop development with C++"**.
-   In *Individual components*, make sure these are checked: *MSVC v143*, *Windows 11
-   SDK*, *C++ CMake tools for Windows*, and *C++ profiling tools* (needed later for
-   the performance analysis).
-2. **Git for Windows** — https://git-scm.com
-3. **vcpkg** (dependency manager). In a *Developer PowerShell for VS 2022*:
+1. Visual Studio 2022 (17.8+) with the "Desktop development with C++"
+   workload. Under Individual components also check: MSVC v143, a Windows SDK,
+   C++ CMake tools for Windows, and C++ profiling tools (used for the
+   performance analysis later).
+2. Git for Windows: https://git-scm.com
+3. vcpkg. In a Developer PowerShell for VS 2022:
    ```powershell
    git clone https://github.com/microsoft/vcpkg C:\vcpkg
    C:\vcpkg\bootstrap-vcpkg.bat
    [Environment]::SetEnvironmentVariable("VCPKG_ROOT", "C:\vcpkg", "User")
    ```
-   Close and reopen the terminal so `VCPKG_ROOT` is visible.
-4. **Pin the vcpkg baseline** (required — without it configure fails with
-   *"this vcpkg instance requires a manifest with a specified baseline"*).
-   From the `mm-engine` project folder:
+   Reopen the terminal afterwards so `VCPKG_ROOT` is visible.
+4. Pin the vcpkg baseline. Without this, the first configure fails with
+   "this vcpkg instance requires a manifest with a specified baseline":
    ```powershell
    cd mm-engine
    & "$env:VCPKG_ROOT\vcpkg.exe" x-update-baseline --add-initial-baseline
    ```
-   This writes a `builtin-baseline` field into `vcpkg.json`, pinned to the
-   commit of *your* vcpkg clone — which is why it isn't hardcoded in the repo.
-   Run it once and you're set. (To pick up newer library versions later:
-   `git -C $env:VCPKG_ROOT pull`, then re-run the same command.)
-5. **stunnel** — https://www.stunnel.org/downloads.html (the Windows installer).
-   reMarkets' FIX endpoint (`fix.remarkets.primary.com.ar:9876`) is TLS; QuickFIX
-   speaks plain TCP to a local stunnel that wraps the TLS.
-6. **Docker Desktop** — for the Prometheus + Grafana stack.
+   This writes a `builtin-baseline` into `vcpkg.json` pinned to the commit of
+   your local vcpkg clone, which is why the value is not hardcoded in the
+   repo. Run it once.
+5. stunnel (https://www.stunnel.org/downloads.html). reMarkets' FIX endpoint
+   is TLS; QuickFIX talks plain TCP to a local stunnel that does the TLS.
+6. Docker Desktop, for Prometheus + Grafana.
+7. Python 3, for the helper scripts. If you also have Python 2 on PATH
+   (it happens), invoke the scripts with `py -3` instead of `python`.
 
-### 2. Open and build the project
+### 2. Build
 
-The project uses CMake presets, which VS 2022 understands natively. Dependencies
-(`quickfix`, `lmdb`, `prometheus-cpp`) are declared in `vcpkg.json` and built
-automatically on first configure — expect 10–20 minutes the first time.
+Dependencies (quickfix, lmdb, prometheus-cpp) are declared in `vcpkg.json`
+and build automatically on the first configure. That first build takes
+10-20 minutes; later ones are seconds.
 
-Option A — inside the IDE:
+In the IDE: File -> Open -> Folder on the `mm-engine` directory (there is no
+.sln; VS opens CMake folders directly), pick the **vs2022-release** preset in
+the toolbar dropdown, wait for the configure to finish in the Output -> CMake
+pane, then Build -> Build All. The binary lands in `build\Release\
+mm_engine.exe` with `config\` copied next to it.
 
-1. *File → Open → Folder...* and select the `mm-engine` folder (do **not** look for
-   a `.sln`; VS opens CMake folders directly).
-2. In the toolbar's configuration dropdown pick **vs2022-release**.
-3. VS runs the CMake configure (watch the *Output → CMake* pane; vcpkg builds the
-   dependencies here). When it finishes, *Build → Build All* (Ctrl+Shift+B).
-4. The binary lands in `build\Release\mm_engine.exe`, with `config\` copied next
-   to it automatically.
-
-> **If the first configure failed** (e.g. with the *"requires a manifest with a
-> specified baseline"* error before you ran step 4 above): fix the cause, then in
-> VS use *Project → Delete Cache and Reconfigure* — a stale CMake cache will
-> otherwise keep replaying the old failure.
-
-Option B — command line (same result):
+Or from the command line, same result:
 
 ```powershell
 cd mm-engine
@@ -147,83 +116,135 @@ cmake --preset vs2022-release
 cmake --build --preset vs2022-release
 ```
 
-If configure fails with "Could not find toolchain file", `VCPKG_ROOT` is not set in
-the environment VS sees — set it as a *User* variable and restart VS.
+Two build problems worth knowing about up front:
 
-### 3. Configure credentials and session
+- If a configure ever fails, fix the cause and then use Project -> Delete
+  Cache and Reconfigure; a stale CMake cache will keep replaying the old
+  error otherwise.
+- If the built exe exits instantly with no output at all, check that all the
+  vcpkg DLLs made it next to it: `dir build\Release\*.dll` should list seven
+  (civetweb x2, lmdb, zlib1, libcrypto, libssl, legacy). vcpkg occasionally
+  finishes building OpenSSL after the copy step has already run; the fix is
+  `Copy-Item build\vcpkg_installed\x64-windows\bin\*.dll build\Release\` or
+  simply rebuilding once.
 
-`config/credentials.txt` must contain the demo account (already provided):
+### 3. Credentials and configuration
 
-```
-username=maildetestsbs22479
-password=uyrufI1$
-account=REM22479
-target=ROFX
-```
+`config/credentials.txt` holds the demo account in `key=value` form (username,
+password, account, target). It is intentionally not committed; copy
+`credentials.txt.example` and fill in the values you were issued.
 
-`config/fix_config.cfg` already maps `SenderCompID` to the username and points to
-`127.0.0.1:8080` (the local stunnel). Note one deliberate change versus the sample
-config that came with the assignment: `SocketNodelay=Y` — Nagle's algorithm batches
-small writes and would add up to ~40 ms to order sends; a market maker always wants
-`TCP_NODELAY`.
+`config/fix_config.cfg` is the session for the real venue, pointing at
+`127.0.0.1:8080` (the local stunnel). One deliberate change versus the sample
+config shipped with the assignment: `SocketNodelay=Y`. Nagle's algorithm
+batches small writes and can add tens of milliseconds to an order send, which
+defeats the purpose of everything else here.
 
-`config/strategy.cfg` holds `MINIMUM_SPREAD`, `ORDER_SPREAD`, `TICK_SIZE`,
-`ORDER_QTY`, `BOOK_DEPTH` (1–5) and the core assignments. Verify `TICK_SIZE` against
-the instrument definition in the reMarkets UI before live runs — quoting off-tick
-gets orders rejected.
+`config/strategy.cfg` holds the market parameters (`MINIMUM_SPREAD`,
+`TICK_SIZE`, `ORDER_QTY`, `BOOK_DEPTH`), the core pinning, and `FIX_CFG`,
+which selects the session config -- this is how you switch between the real
+venue and the local mock exchange below. Check `TICK_SIZE` against the
+instrument in the reMarkets UI before a live run; quoting off-tick gets
+rejected. For DLR futures it is 0.5.
 
-### 4. Run
+`DRY_RUN=1` makes the engine do everything except transmit orders. Use it for
+the first session against the real venue.
 
-Terminal 1 — the TLS tunnel:
+### 4. Run against reMarkets
+
+Terminal 1, the TLS tunnel. Note that the stunnel Windows build reads its
+config from its install directory, so either pass an absolute path or paste
+the contents of `config/stunnel.conf` into
+`C:\Program Files (x86)\stunnel\config\stunnel.conf` and use the GUI's
+Reload Configuration:
 
 ```powershell
-cd mm-engine\config
-& "C:\Program Files (x86)\stunnel\bin\stunnel.exe" stunnel.conf
+& "C:\Program Files (x86)\stunnel\bin\stunnel.exe" C:\full\path\to\mm-engine\config\stunnel.conf
 ```
 
-Terminal 2 — the monitoring stack:
+Verify it listens: `Test-NetConnection 127.0.0.1 -Port 8080` should say
+TcpTestSucceeded: True.
+
+Terminal 2, monitoring:
 
 ```powershell
 cd mm-engine\monitoring
 docker compose up -d
 ```
 
-Terminal 3 — the engine:
+Terminal 3, the engine:
 
 ```powershell
 cd mm-engine\build\Release
 .\mm_engine.exe
 ```
 
-You should see `LOGON FIXT.1.1:maildetestsbs22479->ROFX`, the MarketDataRequest
-confirmation, and a 1 Hz metrics line. Open Grafana at http://localhost:3000
-(admin/admin) — the **MM Engine** dashboard is pre-provisioned with the latency
-percentiles, TPS, backlog and order-rate panels.
+Expect `LOGON FIXT.1.1:<user>->ROFX`, a MarketDataRequest confirmation, and a
+metrics line every second. Grafana is at http://localhost:3000 (admin/admin);
+the "MM Engine" dashboard is provisioned automatically. reMarkets is active
+roughly 10:00-17:00 ART on weekdays; outside those hours the session logs on
+but the books stay empty. During hours you can create activity yourself by
+placing wide orders from https://remarkets.matriz.com.ar/ and watching the
+engine quote inside them -- but log out of the web platform before starting
+the engine, because it appears to hold the FIX session for the same user (see
+the troubleshooting note below).
 
-For the very first session, set `DRY_RUN=1` in `config/strategy.cfg`: the engine
-subscribes, builds books and makes decisions but sends nothing, which lets you verify
-the session and the data before quoting. reMarkets trades roughly during market hours
-(~10:00–17:00 ART, Mon–Fri); outside those hours you'll log on but see no quotes, and
-you can inject liquidity yourself from https://remarkets.matriz.com.ar/ to wake the
-strategy up — watching your own engine tighten the spread you just opened is the most
-satisfying test in this exercise.
+### 5. Run against the local mock exchange
 
-### 5. Load test / profiling mode
+`scripts/mock_exchange.py` is a small FIX simulator (pure Python, no
+dependencies) that accepts the logon, streams 5-level books for all six
+symbols, acks orders and cancels, and fills every fifth order. It alternates
+every 6 seconds between a wide spread, where the engine should quote both
+sides, and a locked book, where the engine should cancel everything -- so
+both branches of the strategy run continuously. This is how the engine can be
+tested end to end with no external dependency and no market hours.
+
+1. In `build\Release\config\strategy.cfg` set
+   `FIX_CFG=config/fix_config_local.cfg` and `DRY_RUN=0`.
+2. Terminal 1: `py -3 scripts\mock_exchange.py`
+3. Terminal 2, in `build\Release`:
+   ```powershell
+   Remove-Item -Recurse -Force store, log   # clear old session state; errors here are fine
+   .\mm_engine.exe
+   ```
+
+The mock's console prints every NewOrderSingle and CancelRequest it receives,
+so you can watch the strategy work in real time; the dashboard fills in
+parallel. Set `FIX_CFG` back to `config/fix_config.cfg` for real sessions.
+
+### 6. Load test / profiling
 
 ```powershell
 .\mm_engine.exe --bench 2000000
 ```
 
-This pushes 2M synthetic full-depth snapshots (mixing wide and narrow spreads, so both
-strategy branches execute) through the *exact* production path — rings, book, strategy,
-order generation — without the network, then prints throughput, p50/p90/p99 for both
-critical flows, and queue high-water marks. This is the binary you attach the profiler
-to; see `docs/ANALYSIS.md` for the full profiling methodology and results.
+Pushes two million synthetic snapshots (wide and narrow mixed) through the
+production pipeline with no network, then prints throughput, the percentiles
+for both flows, and queue high-water marks. This is the binary to attach the
+VS profiler to. Methodology, results and the bottleneck discussion are in
+`docs/ANALYSIS.md`.
 
-### 6. Verifying persistence
+### 7. Inspecting persisted data
 
-LMDB data lands in `data/lmdb` (snapshots under keys `ob|<symbol>|<seq>`, fills under
-`tr|<seq>`). `scripts/dump_lmdb.py` (needs `pip install lmdb`) pretty-prints both.
+LMDB data lands in `data/lmdb`: book snapshots under `ob|<symbol>|<seq>`,
+fills under `tr|<seq>`.
+
+```powershell
+py -3 -m pip install lmdb
+py -3 scripts\dump_lmdb.py data\lmdb
+```
+
+### Troubleshooting the reMarkets logon
+
+If the logon gets no answer, or a Logout with SessionStatus (tag 1409) = 9,
+work through: (a) make sure nothing else is logged in as the same user --
+including the reMarkets web platform, which holds a FIX session of its own;
+(b) stop everything for ten minutes so the server can reap any stale session,
+then try once; (c) delete `store\` and `log\` next to the exe to clear local
+sequence state. If it persists after all three, the session state is stuck on
+the venue side and only Primary can reset it; the mock exchange above covers
+all functional testing in the meantime. The full investigation of this exact
+failure mode, with message logs, is in `docs/ANALYSIS.md` section 6.
 
 ## Repository layout
 
@@ -234,12 +255,14 @@ src/book/       order_book (flat-array L2, AVX2 VWAP)
 src/oms/        order_manager (quote state machine)
 src/strategy/   market_maker (the hot loop)
 src/fix/        fix_app (QuickFIX Application: session, MD parse, order send)
-src/persist/    lmdb_persister (batched cold-thread writes)
-src/metrics/    metrics (registry) + metrics_server (Prometheus exposer)
-src/main.cpp    thread wiring, live + --bench modes
-config/         fix_config.cfg, strategy.cfg, stunnel.conf, dictionaries, symbols
-monitoring/     docker-compose.yml, prometheus.yml, Grafana dashboard (auto-provisioned)
-docs/           ANALYSIS.md — profiling study, bottlenecks, theoretical improvements
+src/storage/    lmdb_persister (batched cold-thread writes)
+src/metrics/    metrics registry + Prometheus exposer
+src/main.cpp    thread wiring, live and --bench modes
+scripts/        mock_exchange.py, dump_lmdb.py
+config/         session configs (venue + local mock), strategy.cfg,
+                stunnel.conf, FIX dictionaries, symbol list
+monitoring/     docker-compose, prometheus.yml, auto-provisioned Grafana dashboard
+docs/           ANALYSIS.md (profiling study) and the screenshots it references
 ```
 
 ## Linux build (optional)
@@ -250,5 +273,6 @@ export VCPKG_ROOT=$HOME/vcpkg   # bootstrap as on Windows
 cmake --preset linux-release && cmake --build --preset linux-release
 ```
 
-On Linux you additionally get `perf`, and isolating the strategy core with
-`isolcpus=2,3 nohz_full=2,3` in the kernel cmdline makes the pinning fully effective.
+Linux adds `perf` for profiling, and isolating the pinned cores with
+`isolcpus=2,3 nohz_full=2,3` on the kernel command line makes the core
+pinning fully effective.
